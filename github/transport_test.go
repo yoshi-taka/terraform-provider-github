@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -528,6 +529,93 @@ func TestRetryTransport_no_sleep_after_last_retry(t *testing.T) {
 	_, _, _ = client.Repositories.Get(ctx, "test", "blah")
 	if time.Since(start) > time.Second {
 		t.Fatalf("Slept after last retry: %s", time.Since(start))
+	}
+}
+
+type recordingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *recordingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type staticTransport struct {
+	responses []*http.Response
+	errs      []error
+	calls     int
+}
+
+func (t *staticTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	resp := t.responses[t.calls]
+	var err error
+	if t.errs != nil {
+		err = t.errs[t.calls]
+	}
+	t.calls++
+	return resp, err
+}
+
+func TestRetryTransport_closes_intermediate_response_bodies(t *testing.T) {
+	statuses := []int{500, 500, 200}
+	bodies := make([]*recordingBody, len(statuses))
+	responses := make([]*http.Response, len(statuses))
+	for i, status := range statuses {
+		bodies[i] = &recordingBody{Reader: strings.NewReader("{}")}
+		responses[i] = &http.Response{StatusCode: status, Body: bodies[i]}
+	}
+
+	rt := NewRetryTransport(&staticTransport{responses: responses},
+		WithMaxRetries(2),
+		WithRetryDelay(time.Millisecond),
+	)
+
+	resp, err := rt.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if err != nil {
+		t.Fatalf("Expected error to be nil, got: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status %d, got: %d", http.StatusOK, resp.StatusCode)
+	}
+
+	for i, body := range bodies {
+		// The final response is owned by the caller, intermediate ones must be closed.
+		wantClosed := i < len(bodies)-1
+		if body.closed != wantClosed {
+			t.Fatalf("Response %d body closed = %t, want %t", i, body.closed, wantClosed)
+		}
+	}
+}
+
+func TestRetryTransport_closes_response_returned_with_error(t *testing.T) {
+	transportErr := errors.New("transport error")
+	firstBody := &recordingBody{Reader: strings.NewReader("{}")}
+	secondBody := &recordingBody{Reader: strings.NewReader("{}")}
+	rt := NewRetryTransport(&staticTransport{
+		responses: []*http.Response{
+			{StatusCode: http.StatusInternalServerError, Body: firstBody},
+			{StatusCode: http.StatusOK, Body: secondBody},
+		},
+		errs: []error{transportErr, nil},
+	},
+		WithMaxRetries(1),
+		WithRetryDelay(time.Millisecond),
+	)
+
+	resp, err := rt.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if err != nil {
+		t.Fatalf("Expected error to be nil, got: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status %d, got: %d", http.StatusOK, resp.StatusCode)
+	}
+	if !firstBody.closed {
+		t.Fatal("Expected response body returned with an error to be closed")
+	}
+	if secondBody.closed {
+		t.Fatal("Expected final response body not to be closed")
 	}
 }
 

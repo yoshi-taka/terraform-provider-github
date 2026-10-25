@@ -283,16 +283,35 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		resp, err = t.transport.RoundTrip(req)
-		if resp != nil && !t.retryableErrors[resp.StatusCode] {
-			return resp, err
+		if err != nil {
+			// A RoundTripper must not return a response alongside an error,
+			// but discard it if one is returned so it cannot leak.
+			drainResponseBody(resp)
+			resp = nil
+		} else if !t.retryableErrors[resp.StatusCode] {
+			return resp, nil
 		}
 
 		if retry < t.maxRetries {
+			// Drain and close the intermediate response body before retrying,
+			// otherwise its connection and resources are leaked.
+			drainResponseBody(resp)
+			resp = nil
 			sleep(req.Context(), t.retryDelay)
 		}
 	}
 
 	return resp, err
+}
+
+// drainResponseBody reads and closes a response body, up to 4KB, so that the
+// underlying connection can be reused and is not leaked.
+func drainResponseBody(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+	_ = resp.Body.Close()
 }
 
 // WithMaxRetries is used to set the max number of retries when encountering an error.
