@@ -245,6 +245,11 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	for retry := 0; retry <= t.maxRetries; retry++ {
 		if err := req.Context().Err(); err != nil {
+			// Before the first attempt we still own the request body. Once
+			// sent, the underlying transport is responsible for closing it.
+			if retry == 0 && req.Body != nil {
+				_ = req.Body.Close()
+			}
 			return nil, err
 		}
 
@@ -304,8 +309,8 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// drainResponseBody reads and closes a response body, up to 4KB, so that the
-// underlying connection can be reused and is not leaked.
+// drainResponseBody reads up to 4KB and closes a discarded response body.
+// Reaching EOF allows the underlying connection to be reused.
 func drainResponseBody(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return

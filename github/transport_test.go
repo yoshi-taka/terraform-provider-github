@@ -535,10 +535,19 @@ func TestRetryTransport_no_sleep_after_last_retry(t *testing.T) {
 type recordingBody struct {
 	io.Reader
 	closed bool
+	reads  int
+	closes int
+}
+
+func (b *recordingBody) Read(p []byte) (int, error) {
+	b.reads++
+	n, err := b.Reader.Read(p)
+	return n, err
 }
 
 func (b *recordingBody) Close() error {
 	b.closed = true
+	b.closes++
 	return nil
 }
 
@@ -616,6 +625,76 @@ func TestRetryTransport_closes_response_returned_with_error(t *testing.T) {
 	}
 	if secondBody.closed {
 		t.Fatal("Expected final response body not to be closed")
+	}
+}
+
+type retryTestTransport func(*http.Request) (*http.Response, error)
+
+func (f retryTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestRetryTransport_cancelled_request_body(t *testing.T) {
+	for _, kind := range []string{"nil", "no_body", "stream", "get_body"} {
+		t.Run(kind, func(t *testing.T) {
+			body := &recordingBody{Reader: strings.NewReader("request")}
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/", nil)
+			switch kind {
+			case "nil":
+				req.Body = nil
+			case "no_body":
+				req.Body = http.NoBody
+			default:
+				req.Body = body
+			}
+			if kind == "get_body" {
+				req.GetBody = func() (io.ReadCloser, error) {
+					t.Fatal("GetBody called on a cancelled request")
+					return nil, nil
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			req = req.WithContext(ctx)
+			rt := NewRetryTransport(retryTestTransport(func(*http.Request) (*http.Response, error) {
+				t.Fatal("Underlying transport called on a cancelled request")
+				return nil, nil
+			}), WithMaxRetries(1))
+
+			resp, err := rt.RoundTrip(req)
+			if resp != nil || !errors.Is(err, context.Canceled) {
+				t.Fatalf("Got (%v, %v), want (nil, context.Canceled)", resp, err)
+			}
+			if kind == "stream" || kind == "get_body" {
+				if body.closes != 1 || body.reads != 0 {
+					t.Fatalf("Body closes = %d, reads = %d; want 1, 0", body.closes, body.reads)
+				}
+			}
+		})
+	}
+}
+
+func TestRetryTransport_cancelled_after_attempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := &recordingBody{Reader: strings.NewReader("request")}
+	t.Cleanup(func() { _ = body.Close() })
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", nil).WithContext(ctx)
+	req.GetBody = func() (io.ReadCloser, error) { return body, nil }
+	calls := 0
+	rt := NewRetryTransport(retryTestTransport(func(*http.Request) (*http.Response, error) {
+		calls++
+		// The underlying transport may close the body asynchronously, after returning.
+		cancel()
+		return nil, context.Canceled
+	}), WithMaxRetries(1), WithRetryDelay(0))
+
+	resp, err := rt.RoundTrip(req)
+	if resp != nil || !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("Got (%v, %v), calls = %d; want (nil, context.Canceled), 1", resp, err, calls)
+	}
+	if body.closes != 0 || body.reads != 0 {
+		t.Fatalf("Sent body closes = %d, reads = %d; want 0, 0", body.closes, body.reads)
 	}
 }
 
